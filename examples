@@ -1,0 +1,156 @@
+/*
+
+These queries were user for my talk at MariaDB Server Fest 2024:
+Unlock data change analysis with Temporal Tables and Window Functions
+
+*/
+
+
+SET SESSION system_versioning_insert_history := 1;
+
+CREATE OR REPLACE TABLE business_customer_subscription (
+    id BIGINT UNSIGNED AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL,
+    ip INET4 NOT NULL,
+    contact_person VARCHAR(200) NOT NULL,
+    subscription_type VARCHAR(100) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE unq_name (name)
+)
+  ENGINE = InnoDB
+;
+
+
+ALTER TABLE business_customer_subscription
+    ADD COLUMN valid_since TIMESTAMP(6) GENERATED ALWAYS AS ROW START INVISIBLE,
+    ADD COLUMN valid_until TIMESTAMP(6) GENERATED ALWAYS AS ROW END INVISIBLE,
+    ADD PERIOD FOR SYSTEM_TIME(valid_since, valid_until),
+    ADD SYSTEM VERSIONING
+;
+
+INSERT INTO business_customer_subscription
+    (id, name, ip, contact_person, subscription_type, valid_since, valid_until)
+    VALUES
+      (1, 'Vulcan Science Academy', '100.240.182.79', 'Spock', 'SILVER', '2023-12-20 00:00:30', '2024-02-02 16:02:02')
+    , (2, 'Timelords Trade Union', '29.86.37.199', 'Doctor', 'SILVER', '2023-10-29 20:25:00', '2024-03-04 15:15:00')
+
+    , (3, 'Acme Corp', '199.216.199.54', 'Charlie Parker', 'SILVER', '2022-12-20 05:10:20', '2023-04-11 08:50:23')
+    , (3, 'Acme Corp', '222.111.10.20', 'Miles Davis', 'GOLD', '2023-04-11 08:50:24', '2023-06-08 09:10:03')
+    , (3, 'Acme Corp', '231.98.4.9', 'Thelonius Monk', 'SILVER', '2023-06-08 09:10:03', '2023-06-08 09:10:03.5555')
+    , (3, 'Acme Corp', '33.161.99.67', 'Oscar Peterson', 'GOLD', '2023-06-08 09:10:03.02', '2024-04-11 09:59:59.8986')
+    , (3, 'Acme Corp', '63.74.52.184', 'Thelonius Monk', 'DIAMOND', '2024-04-11 09:59:59.88', '2024-05-02 13:14:41.678')
+    , (3, 'Acme Corp', '92.44.132.54', 'Charlie Mingus', 'SILVER', '2024-05-02 13:14:42', DEFAULT)
+
+    , (4, 'LexCorp', '155.33.21.101', 'Mr Luthor', 'GOLD', '2022-09-13 11:44:00', '2023-03-27 13:03:00.2')
+    , (4, 'LexCorp', '155.33.21.101', 'Mr Luthor', 'DIAMOND', '2023-03-27 13:03:00.43', DEFAULT)
+    , (5, 'Fisk Industries', '201.6.35.210', 'Richard Fisk', 'GOLD', '2023-10-20 11:30:00', DEFAULT)
+;
+
+SET SESSION system_versioning_insert_history := 0;
+
+SELECT *, valid_since, valid_until FROM business_customer_subscription FOR SYSTEM_TIME ALL;
+
+
+
+
+SELECT * FROM business_customer_subscription;
+
+SELECT *, valid_since, valid_until FROM business_customer_subscription;
+
+SELECT *, valid_since, valid_until FROM business_customer_subscription FOR SYSTEM_TIME ALL;
+
+
+-- history of a row
+
+SELECT *, valid_since, valid_until
+    FROM business_customer_subscription FOR SYSTEM_TIME ALL
+    WHERE name = 'Acme Corp'
+;
+
+-- deleted rows
+
+SELECT *
+FROM (
+    SELECT
+        name, id, valid_since, valid_until,
+        LEAD(id, 1) OVER (PARTITION BY id ORDER BY valid_since) AS next_id
+    FROM business_customer_subscription FOR SYSTEM_TIME ALL
+) v
+    WHERE valid_until < NOW() AND next_id IS NULL
+;
+
+-- inserted rows
+
+SELECT *
+FROM (
+    SELECT
+        name, id, valid_since, valid_until,
+        LAG(id, 1) OVER (PARTITION BY id ORDER BY valid_since) AS prev_id
+    FROM business_customer_subscription FOR SYSTEM_TIME ALL
+) v
+    WHERE prev_id IS NULL
+;
+
+-- new subscriptions with period-over-period comparison
+
+CREATE VIEW new_subscriptions AS (
+SELECT *
+FROM (
+    SELECT
+        name, id, valid_since, valid_until,
+        LAG(id, 1) OVER (PARTITION BY id ORDER BY valid_since) AS prev_id
+    FROM business_customer_subscription FOR SYSTEM_TIME ALL
+) v
+    WHERE prev_id IS NULL
+);
+
+-- if we had enough data, we could aggregate by month.
+-- or we could aggregate by day and use LAG(count, 7) for
+-- a week-over-week comparison
+SELECT subscription_year, count,
+    LAG(count, 1) OVER (ORDER BY subscription_year) AS delta
+    FROM (
+SELECT YEAR(valid_since) AS subscription_year, COUNT(*) AS count
+    FROM new_subscriptions
+    GROUP BY YEAR(valid_since)
+) v;
+
+-- current customers' first subscription
+
+SELECT inserted.name, inserted.id, inserted.valid_since, inserted.valid_until
+FROM (
+    SELECT
+        name, id, valid_since, valid_until,
+        LAG(id, 1) OVER (PARTITION BY id ORDER BY valid_since) AS prev_id
+    FROM business_customer_subscription FOR SYSTEM_TIME ALL
+) inserted
+INNER JOIN business_customer_subscription now
+    ON inserted.id = now.id
+    WHERE inserted.prev_id IS NULL
+    ORDER BY inserted.valid_since
+;
+
+-- subscriptions total age
+
+SELECT
+    name,
+    DATEDIFF(last_end, first_start) AS days,
+    DENSE_RANK() OVER (ORDER BY ROUND(DATEDIFF(last_end, first_start) / 365)) AS dense_rank,
+    RANK() OVER (ORDER BY ROUND(DATEDIFF(last_end, first_start) / 365)) AS rank
+FROM (
+SELECT
+        name,
+        MIN(valid_since) AS first_start,
+        IF(MAX(valid_until) > NOW(), NOW(), MAX(valid_until)) AS last_end
+    FROM business_customer_subscription FOR SYSTEM_TIME ALL
+    GROUP BY name
+) v;
+
+-- rolling sum of subscription duration
+
+SELECT
+    name, valid_since, valid_until,
+    SUM(DATEDIFF(IF(valid_until > NOW(), NOW(), valid_until), valid_since))
+        OVER (PARTITION BY name ORDER BY valid_since) AS days_rolling_sum
+    FROM business_customer_subscription FOR SYSTEM_TIME ALL
+;
